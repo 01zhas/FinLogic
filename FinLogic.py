@@ -6,20 +6,24 @@ import pandas as pd
 from datetime import datetime, timedelta
 from pypfopt import EfficientFrontier, risk_models, expected_returns, objective_functions
 import warnings
+import json
 import os
 import ta
+import cvxpy as cp
 
 warnings.filterwarnings("ignore")
 
 class FinLogic:
-    def __init__(self, data_dir='data', portfolio_file='portfolio.csv'):
+    def __init__(self, data_dir='data', portfolio_file='portfolio.csv', cache_file='cache.json'):
+        self.cache_file = cache_file
+        self.cache = self.load_cache()
         self.data_dir = data_dir
         self.portfolio_file = portfolio_file
         self.current_portfolio = self.load_portfolio()
         self.default_start_date = (datetime.today() - timedelta(days=3*365)).strftime('%Y-%m-%d')
         self.end_date = datetime.today().strftime('%Y-%m-%d')
         self.data_store = {}
-        self.load_data(list(self.current_portfolio.keys()))
+        # self.load_data(list(self.current_portfolio.keys()))
 
     def load_portfolio(self):
         print("Загрузка портфеля...")
@@ -61,72 +65,109 @@ class FinLogic:
 
     def optimize_portfolio(self, new_investment):
         print("Оптимизация портфеля...")
-        conversion_rate = self.get_conversion_rate()
+        self.conversion_rate = self.get_conversion_rate()
 
         all_tickers = self.get_all_tickers()
-        filtered_tickers = self.filter_tickers(all_tickers)
+        filtered_tickers = self.filter_tickers(all_tickers, new_investment)
         
         top_4_tickers = self.get_top_4_by_sortino(filtered_tickers)
         
-        for ticker in top_4_tickers:
-            if ticker not in self.current_portfolio:
-                self.current_portfolio[ticker] = 0  
+        if not top_4_tickers:
+            print("Нет доступных тикеров для оптимизации.")
+            return
         
-        self.load_data(list(self.current_portfolio.keys()))
+        stock_tickers = [ticker for ticker in top_4_tickers if not ticker.endswith("-USD")]
+        crypto_tickers = [ticker for ticker in top_4_tickers if ticker.endswith("-USD")]
         
-        historical_data = pd.concat(self.data_store.values(), axis=1)
-        historical_data.columns = [ticker for ticker in self.data_store.keys()]
-        mu = expected_returns.mean_historical_return(historical_data)
-        S = risk_models.sample_cov(historical_data)
+        self.load_data(top_4_tickers)
         
-        ef = EfficientFrontier(mu, S, weight_bounds=(0.01, 1))
-        current_portfolio_value = sum(self.current_portfolio.values())
-        total_value = current_portfolio_value + new_investment
-        current_weights = {asset: value / total_value for asset, value in self.current_portfolio.items()}
+        data_stocks = pd.concat([self.data_store[ticker] for ticker in stock_tickers], axis=1)
+        data_crypto = pd.concat([self.data_store[ticker] for ticker in crypto_tickers], axis=1)
 
-        ef.add_objective(objective_functions.L2_reg, gamma=0.1)
-        ef.max_sharpe()
-        cleaned_weights = ef.clean_weights()
-        
-        final_allocations = {}
-        for asset, weight in cleaned_weights.items():
-            if self.current_portfolio.get(asset, 0) == 0:
-                final_allocations[asset] = weight * new_investment
-            else:
-                final_allocations[asset] = self.current_portfolio[asset] + (weight * new_investment)
+        returns_stocks = data_stocks.pct_change().dropna()
+        returns_crypto = data_crypto.pct_change().dropna()
+
+        mean_returns_stocks = returns_stocks.mean().values
+        mean_returns_crypto = returns_crypto.mean().values
+
+        cov_matrix_stocks = returns_stocks.cov().values
+        cov_matrix_crypto = returns_crypto.cov().values
+
+        num_assets_stocks = len(stock_tickers)
+        num_assets_crypto = len(crypto_tickers)
+
+        shares_stocks = cp.Variable(num_assets_stocks, integer=True)
+        shares_crypto = cp.Variable(num_assets_crypto)
+
+        binary_stocks = cp.Variable(num_assets_stocks, boolean=True)
+        binary_crypto = cp.Variable(num_assets_crypto, boolean=True)
+
+        current_prices_stocks = data_stocks.iloc[-1].values
+        current_prices_crypto = data_crypto.iloc[-1].values
+
+        objective = cp.Maximize(mean_returns_stocks @ shares_stocks + mean_returns_crypto @ shares_crypto)
+
+        risk_tolerance = 0.02  # Примерное допустимое значение стандартного отклонения (2%)
+
+        constraints = [
+            shares_stocks >= 0,
+            shares_crypto >= 0,
+            shares_stocks <= binary_stocks * 1e6,  # Устанавливаем верхнюю границу для акций
+            shares_crypto <= binary_crypto * 1e6,  # Устанавливаем верхнюю границу для криптовалют
+            shares_stocks @ current_prices_stocks + shares_crypto @ current_prices_crypto == new_investment / self.conversion_rate,
+            shares_stocks @ current_prices_stocks >= binary_stocks * 5000 / self.conversion_rate,
+            shares_crypto @ current_prices_crypto >= binary_crypto * 5000 / self.conversion_rate,
+            cp.quad_form(shares_stocks, cov_matrix_stocks) + cp.quad_form(shares_crypto, cov_matrix_crypto) <= risk_tolerance
+        ]
+
+        problem = cp.Problem(objective, constraints)
+        problem.solve(solver=cp.GUROBI)
+
+        investment_amounts_stocks = shares_stocks.value * current_prices_stocks
+        investment_amounts_crypto = shares_crypto.value * current_prices_crypto
 
         stocks_allocations = {}
         crypto_allocations = {}
-        for asset, final_value in final_allocations.items():
-            if "-USD" in asset:
-                crypto_allocations[asset] = final_value
-            else:
-                stocks_allocations[asset] = final_value
+        stock_quantities = {}
+        crypto_quantities = {}
+        
+        for ticker, num_shares, investment in zip(stock_tickers, shares_stocks.value, investment_amounts_stocks):
+            if num_shares > 0:
+                stocks_allocations[ticker] = investment
+                stock_quantities[ticker] = num_shares
+                
+        for ticker, num_shares, investment in zip(crypto_tickers, shares_crypto.value, investment_amounts_crypto):
+            if num_shares > 0:
+                crypto_allocations[ticker] = investment
+                crypto_quantities[ticker] = num_shares
 
-        def print_allocations(allocations, category):
+        def print_allocations(allocations, quantities, category):
             total_value = sum(allocations.values())
             print(f"\n{category} инвестиции:")
-            for asset, final_value in allocations.items():
-                change = round(final_value - self.current_portfolio.get(asset, 0), 2)
-                final_value_rounded = round(final_value, 2)
-                final_value_usd = round(final_value_rounded / conversion_rate, 2)
-                change_usd = round(change / conversion_rate, 2)
-                print(f"{asset}: {final_value_rounded}₸ ({final_value_usd}$) \033[92m{'+' if change >= 0 else ''}{change}₸ ({change_usd}$)\033[0m")
-            print(f"Общая сумма в {category.lower()}: {round(total_value, 2)}₸ ({round(total_value / conversion_rate, 2)}$)")
+            for ticker, investment in allocations.items():
+                investment_KZT = investment * self.conversion_rate
+                change = round(investment - self.current_portfolio.get(ticker, 0), 2)
+                final_value_rounded = round(investment, 2)
+                final_value_usd = round(final_value_rounded, 2)
+                change_usd = round(change, 2)
+                quantity = quantities[ticker]
+                print(f"{ticker}: {quantity} единиц, {final_value_rounded}$ ({investment_KZT:.2f}₸) \033[92m{'+' if change >= 0 else ''}{change_usd}$ ({change * self.conversion_rate:.2f}₸)\033[0m")
+            print(f"Общая сумма в {category.lower()}: {round(total_value, 2)}$ ({round(total_value * self.conversion_rate, 2)}₸)")
 
-        print_allocations(stocks_allocations, "Акции")
-        print_allocations(crypto_allocations, "Криптовалюты")
+        print_allocations(stocks_allocations, stock_quantities, "Акции")
+        print_allocations(crypto_allocations, crypto_quantities, "Криптовалюты")
 
-        total_investment_value = sum(final_allocations.values())
-        print(f"\nОбщий объем инвестиций: {round(total_investment_value, 2)}₸ ({round(total_investment_value / conversion_rate, 2)}$)")
+        total_investment_value = sum(investment_amounts_stocks) + sum(investment_amounts_crypto)
+        print(f"\nОбщий объем инвестиций: {round(total_investment_value, 2)}$ ({round(total_investment_value * self.conversion_rate, 2)}₸)")
 
         if input("Перезаписать portfolio.csv новыми значениями? (y/n): ").lower() == 'y':
-            new_portfolio = pd.DataFrame(list(final_allocations.items()), columns=['Ticker', 'Value'])
+            new_portfolio = pd.DataFrame(list(stocks_allocations.items()) + list(crypto_allocations.items()), columns=['Ticker', 'Value'])
             new_portfolio['Value'] = new_portfolio['Value'].round(2)  # Округление значений
             new_portfolio.to_csv(self.portfolio_file, index=False)
             print("Файл portfolio.csv обновлен.")
         else:
             print("Обновление файла отменено.")
+
 
     def get_coinmarketcap_tickers(self):
         print("Получение трендовых криптовалют с CoinMarketCap...")
@@ -175,16 +216,66 @@ class FinLogic:
         print(f"Тикеры с Yahoo Finance: {tickers}")
         return tickers
 
+    def get_yahoo_tickers1(self):
+        print("Получение трендовых акций с Yahoo Finance...")
+        url = 'https://finance.yahoo.com/crypto?offset=0&count=100'
+        response = requests.get(url)
+        if response.status_code != 200:
+            print(f"Error: Unable to fetch the page, status code: {response.status_code}")
+            return []
+
+        soup = BeautifulSoup(response.content, 'html.parser')
+        tickers = []
+
+        table = soup.find('tbody')
+        if not table:
+            print("Error: Table with ID 'list-res-table' not found.")
+            return []
+
+        for row in table.find_all('tr'):
+            ticker = row.find('td', {'aria-label': 'Symbol'}).text.strip()
+            tickers.append(ticker)
+
+        print(f"Тикеры с Yahoo Finance: {tickers}")
+        return tickers
+
+    def get_yahoo_tickers2(self):
+        print("Получение трендовых акций с Yahoo Finance...")
+        url = 'https://finance.yahoo.com/most-active?offset=0&count=100'
+        response = requests.get(url)
+        if response.status_code != 200:
+            print(f"Error: Unable to fetch the page, status code: {response.status_code}")
+            return []
+
+        soup = BeautifulSoup(response.content, 'html.parser')
+        tickers = []
+
+        table = soup.find('tbody')
+        if not table:
+            print("Error: Table with ID 'list-res-table' not found.")
+            return []
+
+        for row in table.find_all('tr'):
+            ticker = row.find('td', {'aria-label': 'Symbol'}).text.strip()
+            tickers.append(ticker)
+
+        print(f"Тикеры с Yahoo Finance: {tickers}")
+        return tickers
+
     def get_all_tickers(self):
         print("Получение всех тикеров...")
         coinmarketcap_tickers = self.get_coinmarketcap_tickers()
         yahoo_tickers = self.get_yahoo_tickers()
+        yahoo_tickers1 = self.get_yahoo_tickers1()
+        yahoo_tickers2 = self.get_yahoo_tickers2()
+
+
         
-        all_tickers = list(set(coinmarketcap_tickers + yahoo_tickers))  # Удаление дубликатов
+        all_tickers = list(set(coinmarketcap_tickers + yahoo_tickers + yahoo_tickers1 + yahoo_tickers2))  # Удаление дубликатов
         print(f"Все тикеры: {all_tickers}")
         return all_tickers
 
-    def filter_tickers(self, tickers):
+    def filter_tickers(self, tickers, new_investment):
         print("Фильтрация тикеров...")
         filtered_tickers = []
         for ticker in tickers:
@@ -192,9 +283,18 @@ class FinLogic:
                 stock = yf.Ticker(ticker)
                 market_cap = stock.info.get('marketCap')
                 volume = stock.info.get('volume')
+                current_price = stock.history(period="1d")['Close'].iloc[0]
+
+                # Check if the market cap and volume meet the criteria
                 if market_cap and market_cap > 1e9 and volume and volume > 1e6:
-                    filtered_tickers.append(ticker)
-            except Exception:
+                    # For stocks, check if the price does not exceed 40% of the new investment
+                    if not ticker.endswith("-USD") and current_price <= 0.4 * (new_investment / self.conversion_rate):
+                        filtered_tickers.append(ticker)
+                    # For cryptocurrencies, just add them without the price check
+                    elif ticker.endswith("-USD"):
+                        filtered_tickers.append(ticker)
+            except Exception as e:
+                print(f"Ошибка при обработке тикера {ticker}: {e}")
                 continue  # Игнорируем ошибки и продолжаем обработку следующих тикеров
         print(f"Отфильтрованные тикеры: {filtered_tickers}")
         return filtered_tickers
@@ -218,7 +318,7 @@ class FinLogic:
         sortino_ratio = expected_return / downside_std
         print(f"Коэффициент Сортино для {ticker}: {sortino_ratio}")
         return sortino_ratio
-    
+
     def calculate_technical_indicators(self, ticker, start_date):
         print(f"Расчет технических индикаторов для {ticker}...")
         stock = yf.Ticker(ticker)
@@ -254,33 +354,54 @@ class FinLogic:
         crypto = None
         stocks = []
 
+
         for ticker, ratio in sorted_tickers:
-            if crypto is None and "-USD" in ticker:
-                if self.check_asset_availability(ticker):
-                    crypto = ticker
-            elif len(stocks) < 3:
-                if self.check_asset_availability(ticker):
-                    stocks.append(ticker)
-            if crypto and len(stocks) == 3:
-                break
+            if self.check_asset_availability(ticker):
+                top_4_tickers.append(ticker)
 
-        if crypto:
-            top_4_tickers.append(crypto)
-        top_4_tickers.extend(stocks)
+        # for ticker, ratio in sorted_tickers:
+        #     if crypto is None and "-USD" in ticker:
+        #         if self.check_asset_availability(ticker):
+        #             crypto = ticker
+        #     elif len(stocks) < 3:
+        #         if self.check_asset_availability(ticker):
+        #             stocks.append(ticker)
+        #     if crypto and len(stocks) == 3:
+        #         break
 
-        for ticker in top_4_tickers:
-            tech_data = tech_indicators[ticker]
-            print(f"{ticker}: Sortino Ratio: {sortino_ratios[ticker]}, SMA_50: {tech_data['SMA_50']}, SMA_200: {tech_data['SMA_200']}, RSI: {tech_data['RSI']}")
+        # if crypto:
+        #     top_4_tickers.append(crypto)
+        # top_4_tickers.extend(stocks)
+
+        # for ticker in top_4_tickers:
+        #     tech_data = tech_indicators[ticker]
+        #     print(f"{ticker}: Sortino Ratio: {sortino_ratios[ticker]}, SMA_50: {tech_data['SMA_50']}, SMA_200: {tech_data['SMA_200']}, RSI: {tech_data['RSI']}")
 
         return top_4_tickers
 
+    def load_cache(self):
+        if os.path.exists(self.cache_file):
+            with open(self.cache_file, 'r') as file:
+                return json.load(file)
+        return {}
+
+    def save_cache(self):
+        with open(self.cache_file, 'w') as file:
+            json.dump(self.cache, file)
+
     def check_asset_availability(self, ticker):
+        if ticker in self.cache:
+            available = self.cache[ticker]
+            print(f"Актив {ticker} {'доступен' if available else 'недоступен'} для приобретения (из кэша).")
+            return available
+
         response = input(f"Можете ли вы приобрести {ticker}? (y/n): ").strip().lower()
         available = response == 'y'
+        self.cache[ticker] = available
+        self.save_cache()
         print(f"Актив {ticker} {'доступен' if available else 'недоступен'} для приобретения.")
         return available
-    
 
 fin_logic = FinLogic('data', 'portfolio.csv')
-new_investment = 140000
+new_investment = 355800
 final_allocations = fin_logic.optimize_portfolio(new_investment)
